@@ -25,7 +25,7 @@ function stripFrontmatter(raw: string): string {
 
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } },
+  { params }: { params: Promise<{ id: string }> },
 ) {
   let body: { message?: string; sessionId?: string };
   try {
@@ -35,7 +35,7 @@ export async function POST(
   }
   const message = body.message?.trim();
   if (!message) return new Response('Missing message', { status: 400 });
-  const pluginId = params.id;
+  const { id: pluginId } = await params;
 
   // Resolve the plugin's on-disk path.
   const all = await resolveRolePaths();
