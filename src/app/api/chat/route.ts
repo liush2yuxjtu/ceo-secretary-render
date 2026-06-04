@@ -201,11 +201,16 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Figure out the base URL for in-process subagent dispatch. On any
-  // Next.js host, the route receives a request and we can echo the
-  // request's own scheme + host back as the internal base.
+  // Figure out the base URL for in-process subagent dispatch. On Render
+  // (and any reverse-proxied host), req.url reflects the public URL, so
+  // echoing it back forces the fetch through the load balancer — that
+  // adds latency and can fail with `fetch failed` on the in-process
+  // self-loopback. Prefer the local port (set by the platform) so the
+  // fetch stays in the same Node process.
   const reqUrl = new URL(req.url);
-  const internalBase = `${reqUrl.protocol}//${reqUrl.host}`;
+  const internalBase = process.env.PORT
+    ? `http://127.0.0.1:${process.env.PORT}`
+    : `${reqUrl.protocol}//${reqUrl.host}`;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -346,6 +351,7 @@ export async function POST(req: NextRequest) {
               });
             } catch (e) {
               const msg = e instanceof Error ? e.message : 'subagent failed';
+              console.log(`[chat] subagent ${subId} error: ${msg}`);
               send({
                 type: 'hotload_done',
                 subagentId: subId,
