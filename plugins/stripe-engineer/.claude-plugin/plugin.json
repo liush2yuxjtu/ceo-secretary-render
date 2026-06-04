@@ -1,0 +1,7 @@
+{
+  "name": "stripe-engineer",
+  "version": "0.2.0",
+  "description": "����— ONLY Stripe 支付实施：Checkout、Subscription、Webhooks、Connect",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["stripe-engineer", "ceo-secretary", "subagent"]
+}

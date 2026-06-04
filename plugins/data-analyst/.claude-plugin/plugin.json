@@ -1,0 +1,7 @@
+{
+  "name": "data-analyst",
+  "version": "0.2.0",
+  "description": "����— 指标、SQL、看板、归因",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["data-analyst", "ceo-secretary", "subagent"]
+}

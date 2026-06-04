@@ -1,0 +1,7 @@
+{
+  "name": "product-manager",
+  "version": "0.2.0",
+  "description": "����— PRD、用户故事、优先级",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["product-manager", "ceo-secretary", "subagent"]
+}

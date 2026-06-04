@@ -1,0 +1,7 @@
+{
+  "name": "reviewer",
+  "version": "0.2.0",
+  "description": "����— 正确性、安全、性能 — 严重度分级找 bug",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["reviewer", "ceo-secretary", "subagent"]
+}

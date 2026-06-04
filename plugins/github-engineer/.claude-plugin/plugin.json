@@ -1,0 +1,7 @@
+{
+  "name": "github-engineer",
+  "version": "0.2.0",
+  "description": "����— ONLY GitHub 平台：Actions、API、Repo 自动化、Releases",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["github-engineer", "ceo-secretary", "subagent"]
+}

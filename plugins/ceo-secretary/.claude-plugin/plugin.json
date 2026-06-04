@@ -1,0 +1,7 @@
+{
+  "name": "ceo-secretary",
+  "version": "0.2.0",
+  "description": "中文 CEO 助理 — 单 main chat 入口；按需 hot-load 其他角色 plugin 来交付任务。",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["ceo", "秘书", "secretary", "orchestrator", "router", "中文"]
+}

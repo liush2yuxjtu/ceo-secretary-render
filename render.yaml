@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: ceo-secretary
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /
+    # Free plan = 512 MB RAM. Next.js build of this app produces ~80 MB of
+    # .next output + ~300 MB of node_modules. The runtime image is
+    # ~600 MB. Render free caps at 2 GB image, so we fit.
+    envVars:
+      - key: ANTHROPIC_BASE_URL
+        sync: false
+      - key: ANTHROPIC_AUTH_TOKEN
+        sync: false
+      - key: ANTHROPIC_MODEL
+        sync: false

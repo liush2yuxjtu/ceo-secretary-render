@@ -1,0 +1,7 @@
+{
+  "name": "finance-controller",
+  "version": "0.2.0",
+  "description": "����— 预算、单价、现金流",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["finance-controller", "ceo-secretary", "subagent"]
+}

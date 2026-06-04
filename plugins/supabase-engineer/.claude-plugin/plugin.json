@@ -1,0 +1,7 @@
+{
+  "name": "supabase-engineer",
+  "version": "0.2.0",
+  "description": "����— ONLY Supabase 实施：Postgres、Auth、RLS、Realtime、Edge Functions",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["supabase-engineer", "ceo-secretary", "subagent"]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "notion-engineer",
+  "version": "0.2.0",
+  "description": "����— ONLY Notion 工作流：Database、Page、API、自动化",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["notion-engineer", "ceo-secretary", "subagent"]
+}

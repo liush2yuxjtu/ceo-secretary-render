@@ -1,0 +1,7 @@
+{
+  "name": "designer",
+  "version": "0.2.0",
+  "description": "����— UI/UX 评审、视觉规范、可访问性",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["designer", "ceo-secretary", "subagent"]
+}

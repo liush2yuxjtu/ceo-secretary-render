@@ -1,0 +1,7 @@
+{
+  "name": "customer-success",
+  "version": "0.2.0",
+  "description": "����— 客户旅程、续费、流失预警",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["customer-success", "ceo-secretary", "subagent"]
+}

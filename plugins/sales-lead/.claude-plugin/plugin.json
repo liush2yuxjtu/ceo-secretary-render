@@ -1,0 +1,7 @@
+{
+  "name": "sales-lead",
+  "version": "0.2.0",
+  "description": "����— 销售流程、话术、Pipeline",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["sales-lead", "ceo-secretary", "subagent"]
+}

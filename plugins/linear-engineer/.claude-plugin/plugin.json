@@ -1,0 +1,7 @@
+{
+  "name": "linear-engineer",
+  "version": "0.2.0",
+  "description": "����— ONLY Linear 研发管理：Issues、Cycle、Projects、API",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["linear-engineer", "ceo-secretary", "subagent"]
+}

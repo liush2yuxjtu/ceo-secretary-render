@@ -1,0 +1,7 @@
+{
+  "name": "researcher",
+  "version": "0.2.0",
+  "description": "����— 多源调研、引用、综合报告",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["researcher", "ceo-secretary", "subagent"]
+}

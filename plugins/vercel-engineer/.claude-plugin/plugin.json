@@ -1,0 +1,7 @@
+{
+  "name": "vercel-engineer",
+  "version": "0.2.0",
+  "description": "����— ONLY Vercel 平台实施：Next.js 部署、Functions、AI Gateway、Edge",
+  "author": { "name": "Plugin as Entrance" },
+  "keywords": ["vercel-engineer", "ceo-secretary", "subagent"]
+}
