@@ -1,31 +1,23 @@
 // POST /api/chat — stream a chat completion from CEO秘书.
 //
-// v4.0.0 (Vercel Sandbox orchestrator): the Anthropic Agent SDK cannot run
-// inside a Vercel Function — at every version (0.2.109 pure-JS, 0.3.x with
-// a 244 MB Bun binary) the SDK's `query()` loop silently produces zero
-// output and the function returns 200 + empty body. See
-// docs/adr/0003-v3-direct-fetch.md §"Tested counter-hypothesis".
+// v4.1 (portable orchestrator): the previous version (v4.0.0) ran the
+// Anthropic Agent SDK inside a Vercel Sandbox microVM, with the
+// Function merely orchestrating JSONL-over-stdout. v4.1 replaces the
+// sandbox with two direct-fetch paths in the same Function:
 //
-// Vercel Sandbox (https://vercel.com/kb/guide/using-vercel-sandbox-claude-agent-sdk)
-// is the documented escape hatch: a real Linux microVM in iad1 with no
-// 250 MB bundle cap, no Firecracker seccomp restrictions, and 5-hour
-// timeouts. We:
-//   1. read the plugin prompts in the Function (fs.readFile on plugins/,
-//      which is traced into the bundle via outputFileTracingIncludes)
-//   2. ship those prompts + the user's message to a *persistent* Vercel
-//      Sandbox (one named `ceo-secretary` per project, resumed from
-//      snapshot after first install)
-//   3. run a small Node script inside the sandbox that calls the SDK's
-//      `query()` and prints each event as one JSON line on stdout
-//   4. forward those JSONL lines to the client as `ChatStreamEvent` SSE
+//   1. Main thread: a /v1/messages call with the CEO秘书 system prompt
+//      and a `Task` tool definition. When the main agent emits
+//      tool_use for Task, we (2) below.
+//   2. Subagent dispatch: POST /api/plugin/{pluginId} with the task
+//      message; that route is a thin /v1/messages wrapper that loads
+//      the plugin's system prompt and returns the text.
 //
-// The sandbox installs the SDK on first call (one-time, ~20 s) and
-// resumes from snapshot on every subsequent call (~1 s). On Pro this
-// costs ~$0.01-0.05 per chat session.
+// Same wire shape as v4.0.0: SSE stream of {start, delta, hotload,
+// hotload_done, message, done, error} events. The 504-line v4 file
+// shrinks to ~300 because we no longer have a sandbox lifecycle to
+// manage.
 
 import { NextRequest } from 'next/server';
-import { Sandbox } from '@vercel/sandbox';
-import { randomUUID } from 'node:crypto';
 import {
   MAIN_ROLE_ID,
   getMainRole,
@@ -36,27 +28,12 @@ import type { ChatStreamEvent } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-export const maxDuration = 300; // seconds (matches Vercel Sandbox Pro max of 5h)
+export const maxDuration = 300; // seconds
 
-// One persistent sandbox per project. The SDK install + node_modules live
-// in this sandbox's filesystem snapshot, so we pay the install cost once
-// and every subsequent chat resumes from the cached snapshot.
-const SANDBOX_NAME = 'ceo-secretary-default';
-
-// Where inside the sandbox the script and request live. We copy the
-// sources from the Function bundle into the sandbox on first call; on
-// subsequent calls the snapshot already has them.
-const SANDBOX_HERE = '/vercel/sandbox/ceo-secretary';
-const SANDBOX_REQUEST_FILE = `${SANDBOX_HERE}/request.json`;
-const SANDBOX_SCRIPT = `${SANDBOX_HERE}/run-query.mjs`;
-const SANDBOX_PACKAGE_JSON = `${SANDBOX_HERE}/package.json`;
-
-// Hard ceiling on the streaming wall clock. The SDK + provider can
-// sometimes hang after a subagent turn. Mirrors the v0.2.0 hard timeout.
+// Hard ceiling on the wall clock of one chat turn. Mirrors v0.2.0.
 const HARD_TIMEOUT_MS = 120_000;
-
-// Sandbox-level timeout (default 5m, can extend to 5h on Pro).
-const SANDBOX_TIMEOUT_MS = 5 * 60 * 1000;
+const MAX_TURNS = 6; // matches SDK default
+const MAX_TASK_DEPTH = 1; // matches SDK default — no sub-spawning
 
 // ── SSE helpers (route → client) ──────────────────────────────────────────
 function sse(event: ChatStreamEvent): Uint8Array {
@@ -68,115 +45,126 @@ function preview(text: string, max = 200): string {
   return t.length > max ? t.slice(0, max) + '…' : t;
 }
 
+// Strip YAML frontmatter from agent markdown prompts.
+function stripFrontmatter(raw: string): string {
+  return raw.replace(/^---\n[\s\S]*?\n---\n?/, '');
+}
+
 // ── Plugin prompt loading (Function-side) ────────────────────────────────
 async function loadAgentPrompt(pluginPath: string, agentName: string): Promise<string> {
   const { readFile } = await import('node:fs/promises');
   const file = `${pluginPath}/agents/${agentName}.md`;
   const raw = await readFile(file, 'utf8');
-  return raw.replace(/^---\n[\s\S]*?\n---\n?/, '');
+  return stripFrontmatter(raw);
 }
 
-// ── Sandbox bootstrap: install the Claude Code CLI once ─────────────────
-async function ensureSandboxReady(sandbox: Sandbox): Promise<void> {
-  // Always write the latest source files (cheap; lets us update the script
-  // and package.json without re-snapshotting).
-  const { readFile } = await import('node:fs/promises');
-  const [pkg, script] = await Promise.all([
-    readFile(`${process.cwd()}/src/sandbox/package.json`, 'utf8'),
-    readFile(`${process.cwd()}/src/sandbox/run-query.mjs`, 'utf8'),
-  ]);
-  await sandbox.writeFiles([
-    { path: SANDBOX_PACKAGE_JSON, content: Buffer.from(pkg) },
-    { path: SANDBOX_SCRIPT, content: Buffer.from(script) },
-  ]);
-
-  // Probe: is the `claude` CLI on PATH yet?
-  const probe = await sandbox
-    .runCommand({
-      cmd: 'sh',
-      args: ['-c', 'command -v claude >/dev/null 2>&1'],
-    })
-    .catch(() => null);
-  if (probe && probe.exitCode === 0) {
-    return; // CLI is already installed in the snapshot
-  }
-
-  // First-time install: Claude Code CLI (which ships the `claude` binary
-  // plus its companion Node.js daemon). npm install -g requires root,
-  // which Vercel Sandbox gives us via `sudo: true`.
-  console.log('[chat] sandbox: first-time Claude Code CLI install (~30s)…');
-  const install = await sandbox.runCommand({
-    cmd: 'npm',
-    args: ['install', '-g', '@anthropic-ai/claude-code', '--no-audit', '--no-fund', '--loglevel=error'],
-    sudo: true,
-  });
-  if (install.exitCode !== 0) {
-    const err = (await install.stderr().catch(() => '')) || '';
-    throw new Error(
-      `sandbox npm install -g claude-code failed (exit ${install.exitCode}): ${err.slice(0, 500)}`,
-    );
-  }
-  console.log('[chat] sandbox: Claude Code CLI installed');
-}
-
-// ── Build the SDK options the same way v0.2.0 did, but inlined ───────────
-async function buildSdkOptions() {
-  const all = await resolveRolePaths();
-  const main = all.find((r) => r.id === MAIN_ROLE_ID);
-  if (!main || !main.pluginPath) {
-    return { error: 'main role plugin not installed' as const };
-  }
-  const subagents: Role[] = all.filter(
-    (r) => r.id !== MAIN_ROLE_ID && r.pluginPath,
-  );
-
-  // Pre-load every subagent's agent prompt here (in the Function) so the
-  // sandbox never needs to read files — it just gets a self-contained
-  // JSON payload.
-  const agents: Record<string, { description: string; prompt: string }> = {};
-  for (const s of subagents) {
-    if (!s.pluginPath) continue;
-    const safeKey = s.id.replace(/[^a-zA-Z0-9_-]/g, '-');
-    let prompt: string;
-    try {
-      prompt = await loadAgentPrompt(s.pluginPath, s.agentName);
-    } catch (e) {
-      // Skip agents whose prompts are missing — the role catalog might
-      // list a role whose plugin isn't fully populated.
-      continue;
-    }
-    agents[safeKey] = {
-      description: `${s.english} — ${s.tagline}`,
-      prompt,
-    };
-  }
-
-  // CEO秘书 main persona (also pre-loaded).
-  let ceoSecretaryPrompt: string;
-  try {
-    ceoSecretaryPrompt = await loadAgentPrompt(main.pluginPath, main.agentName);
-  } catch (e) {
-    return { error: `cannot read main agent prompt: ${(e as Error).message}` as const };
-  }
-
-  return {
-    options: {
-      model: process.env.ANTHROPIC_MODEL ?? 'MiniMax-M3',
-      plugins: [{ type: 'local' as const, path: main.pluginPath! }],
-      agent: main.agentName,
-      permissionMode: 'bypassPermissions' as const,
-      includePartialMessages: true,
-      maxTurns: 6,
-      agents,
-      systemPrompt: {
-        type: 'preset' as const,
-        preset: 'claude_code' as const,
-        append: ceoSecretaryPrompt,
+// Task tool definition. The model is told it can dispatch a subagent by
+// emitting tool_use for this tool with a subagent_type and a prompt.
+const TASK_TOOL = {
+  name: 'Task',
+  description:
+    'Spawn a specialized subagent to handle part of the task. Use this when ' +
+    'a question matches a known role (e.g. CTO for architecture, designer for ' +
+    'UI, finance-controller for budgets). subagent_type is the kebab-case role id; ' +
+    'prompt is the full instruction to send to the subagent.',
+  input_schema: {
+    type: 'object' as const,
+    properties: {
+      subagent_type: {
+        type: 'string',
+        description:
+          'The role id to dispatch to (e.g. "cto-advisor", "designer", "finance-controller").',
       },
-      settingSources: ['project'] as const,
-      env: { ...process.env },
+      prompt: {
+        type: 'string',
+        description: 'The full instruction to send to the subagent.',
+      },
+      description: {
+        type: 'string',
+        description: 'A short label for the user, optional.',
+      },
     },
-  };
+    required: ['subagent_type', 'prompt'],
+  },
+};
+
+// ── Upstream call to /v1/messages (non-streaming for v4.1) ───────────────
+type ContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'tool_use'; id: string; name: string; input: unknown };
+
+type UpstreamResponse = {
+  content: ContentBlock[];
+  stop_reason?: string;
+  model?: string;
+  usage?: unknown;
+};
+
+async function callUpstream(args: {
+  system: string;
+  messages: Array<{ role: 'user' | 'assistant'; content: unknown }>;
+  tools?: unknown[];
+  maxTokens?: number;
+}): Promise<UpstreamResponse> {
+  const baseUrl = process.env.ANTHROPIC_BASE_URL;
+  const token =
+    process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
+  const model = process.env.ANTHROPIC_MODEL || 'MiniMax-M3';
+  if (!baseUrl || !token) {
+    throw new Error('Missing ANTHROPIC_BASE_URL or ANTHROPIC_API_KEY env');
+  }
+  const r = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': token,
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'prompt-caching-2024-07-31',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: args.maxTokens ?? 4096,
+      system: [
+        {
+          type: 'text',
+          text: args.system,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      tools: args.tools,
+      messages: args.messages,
+    }),
+  });
+  if (!r.ok) {
+    const errText = await r.text();
+    throw new Error(`upstream ${r.status}: ${errText.slice(0, 500)}`);
+  }
+  return (await r.json()) as UpstreamResponse;
+}
+
+// ── Subagent dispatch: POST /api/plugin/{pluginId} ────────────────────────
+async function dispatchSubagent(
+  baseUrl: string,
+  pluginId: string,
+  prompt: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const url = `${baseUrl}/api/plugin/${encodeURIComponent(pluginId)}`;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ message: prompt }),
+    signal,
+  });
+  if (!r.ok) {
+    const errText = await r.text();
+    throw new Error(`subagent ${pluginId} ${r.status}: ${errText.slice(0, 500)}`);
+  }
+  const data = (await r.json()) as { text?: string; error?: string };
+  if (typeof data.text !== 'string') {
+    throw new Error(`subagent ${pluginId} returned no text: ${JSON.stringify(data).slice(0, 300)}`);
+  }
+  return data.text;
 }
 
 // ── Route handler ─────────────────────────────────────────────────────────
@@ -189,47 +177,36 @@ export async function POST(req: NextRequest) {
   }
   const message = body.message?.trim();
   if (!message) return new Response('Missing message', { status: 400 });
-
-  const startedAt = Date.now();
   const sessionId = body.sessionId;
 
-  // Build the SDK options + write the request payload inside the sandbox.
-  const built = await buildSdkOptions();
-  if ('error' in built) {
-    return new Response(built.error, { status: 424 });
-  }
+  const startedAt = Date.now();
 
-  // Debug: log function env at the top of the handler.
-  const fnEnv = Object.fromEntries(
-    Object.entries(process.env).filter(([k]) => k.startsWith('ANTHROPIC_')),
+  // Load the main agent's system prompt up front. We also pre-build a
+  // directory of available subagent IDs so we can refuse unknown ones.
+  const roles = await resolveRolePaths();
+  const mainRole = roles.find((r) => r.id === MAIN_ROLE_ID) ?? getMainRole();
+  if (!mainRole.pluginPath) {
+    return new Response('main role plugin not installed', { status: 424 });
+  }
+  const subagentIds = new Set(
+    roles.filter((r) => r.id !== MAIN_ROLE_ID).map((r) => r.id),
   );
-  console.log(`[chat] function env keys: ${Object.keys(fnEnv).join(',')}`);
-  for (const [k, v] of Object.entries(fnEnv)) {
-    console.log(`[chat] fn env: ${k}=${String(v).slice(0, 12)}…(len=${String(v).length})`);
+  let mainSystemPrompt: string;
+  try {
+    mainSystemPrompt = await loadAgentPrompt(mainRole.pluginPath, mainRole.agentName);
+  } catch (e) {
+    return new Response(
+      `cannot read main agent prompt: ${(e as Error).message}`,
+      { status: 424 },
+    );
   }
 
-  // Collect the env vars the SDK needs. We pass them inside the
-  // request JSON (rather than via runCommand.env) because the @vercel/
-  // sandbox SDK does not always forward env to the spawned child
-  // process tree, and the SDK then spawns its own child (cli.js).
-  // Putting the values in the request file guarantees they reach
-  // the SDK's options.env regardless of process env propagation.
-  const forwardedEnv: Record<string, string> = {};
-  for (const k of [
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_AUTH_TOKEN',
-    'ANTHROPIC_BASE_URL',
-    'ANTHROPIC_MODEL',
-    'ANTHROPIC_VERSION',
-    'ANTHROPIC_DEFAULT_OPUS_MODEL',
-    'ANTHROPIC_DEFAULT_SONNET_MODEL',
-    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  ]) {
-    const v = process.env[k];
-    if (typeof v === 'string' && v.length > 0) forwardedEnv[k] = v;
-  }
+  // Figure out the base URL for in-process subagent dispatch. On any
+  // Next.js host, the route receives a request and we can echo the
+  // request's own scheme + host back as the internal base.
+  const reqUrl = new URL(req.url);
+  const internalBase = `${reqUrl.protocol}//${reqUrl.host}`;
 
-  const requestId = randomUUID();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const safeEnqueue = (chunk: Uint8Array) => {
@@ -241,10 +218,6 @@ export async function POST(req: NextRequest) {
       };
       const send = (e: ChatStreamEvent) => safeEnqueue(sse(e));
 
-      const mainRole = getMainRole();
-      send({ type: 'start', roleId: mainRole.id, sessionId });
-
-      // Hard timeout safety net.
       const ac = new AbortController();
       let timedOut = false;
       const hardTimer = setTimeout(() => {
@@ -252,216 +225,148 @@ export async function POST(req: NextRequest) {
         ac.abort();
       }, HARD_TIMEOUT_MS);
 
-      let sandbox: Sandbox | null = null;
-      let command: import('@vercel/sandbox').CommandFinished | null = null;
+      send({ type: 'start', roleId: mainRole.id, sessionId });
+
       try {
-        console.log('[chat] step 1: get-or-create sandbox');
-        const t0 = Date.now();
-        // Get-or-create the persistent sandbox. The first create costs
-        // ~20s (npm install); every subsequent call resumes from snapshot
-        // in ~1s. The OIDC token is read from the VERCEL_OIDC_TOKEN env
-        // var that Vercel injects automatically.
-        //
-        // We tag the sandbox with `project=ceo-secretary` so we can find
-        // it again across Function cold starts via Sandbox.list().
-        //
-        // The v1.10.2 type defs are behind the runtime API: `vcpus` and
-        // `tags` are accepted at runtime but missing from the published
-        // types. Cast to `any` for the create params; treat the result
-        // as a strongly-typed Sandbox.
-        console.log('[chat] step 1a: list');
-        const list = (await Sandbox.list({})) as unknown as {
-          sandboxes: Array<{
-            id: string;
-            status: string;
-            tags?: Record<string, string>;
-          }>;
-        };
-        console.log(`[chat] step 1b: list returned ${list.sandboxes?.length ?? 0} sandboxes (${Date.now() - t0}ms)`);
-        const existing = list.sandboxes?.find(
-          (s) => s.tags?.project === 'ceo-secretary',
-        );
-        if (existing && existing.status !== 'stopped' && existing.status !== 'failed') {
-          console.log(`[chat] step 1c: get existing ${existing.id}`);
-          sandbox = await Sandbox.get({ sandboxId: existing.id });
-          console.log(`[chat] step 1d: get done (${Date.now() - t0}ms)`);
-        } else {
-          console.log('[chat] step 1c: create new (existing: ' + (existing?.status ?? 'none') + ')');
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          sandbox = await Sandbox.create({
-            runtime: 'node22',
-            timeout: SANDBOX_TIMEOUT_MS,
-            ...({ vcpus: 2, memory: 4096, tags: { project: 'ceo-secretary' } } as any),
-          });
-          console.log(`[chat] step 1d: create done (${Date.now() - t0}ms)`);
-        }
-        if (!sandbox) throw new Error('sandbox handle is null after get/create');
-        console.log(`[chat] step 1 done (${Date.now() - t0}ms): sandbox ready`);
-        const t1 = Date.now();
-        await ensureSandboxReady(sandbox);
-        console.log(`[chat] step 2 done (${Date.now() - t1}ms): bootstrap done`);
+        // The main thread's conversation. Each turn is one /v1/messages
+        // call; we keep going until the model returns a turn with no
+        // tool_use or we hit MAX_TURNS.
+        const messages: Array<{
+          role: 'user' | 'assistant';
+          content: unknown;
+        }> = [{ role: 'user', content: message }];
 
-        // Write the request file into the sandbox. We *also* write the
-        // env vars to a separate file that the script reads directly —
-        // putting them in the JSON options field doesn't always reach
-        // the SDK's spawned `cli.js` child process.
-        const t2 = Date.now();
-        const payload = {
-          prompt: message,
-          sessionId,
-          model: process.env.ANTHROPIC_MODEL ?? 'MiniMax-M3',
-          env: forwardedEnv,
-          options: built.options,
-        };
-        await sandbox.writeFiles([
-          { path: SANDBOX_REQUEST_FILE, content: Buffer.from(JSON.stringify(payload)) },
-          {
-            path: `${SANDBOX_HERE}/.env.runtime`,
-            content: Buffer.from(
-              Object.entries(forwardedEnv)
-                .map(([k, v]) => `${k}=${v}`)
-                .join('\n'),
-            ),
-          },
-        ]);
-        console.log(`[chat] step 3 done (${Date.now() - t2}ms): files written`);
+        let finalText = '';
 
-        // Run the script. We use blocking mode (not detached) so the
-        // SDK's command.stdout() reader returns the full output after
-        // the script exits. The Vercel Sandbox SDK's streaming via
-        // command.logs() on detached commands is unreliable in the
-        // current version; the blocking path is the documented pattern
-        // for SDK consumers who want to read the full result.
-        const t3 = Date.now();
-        command = await sandbox.runCommand({
-          cmd: 'node',
-          args: [SANDBOX_SCRIPT, SANDBOX_REQUEST_FILE],
-          cwd: SANDBOX_HERE,
-          signal: ac.signal,
-        });
-        console.log(`[chat] step 4 done (${Date.now() - t3}ms): runCommand returned, exitCode=${command?.exitCode}`);
-
-        // Read the full stdout of the script. command.stdout() returns
-        // a Promise<string> for blocking commands.
-        const t4 = Date.now();
-        const fullStdout = (await command.stdout().catch((e: Error) => {
-          console.error(`[chat] command.stdout() error: ${e.message}`);
-          return '';
-        })) || '';
-        console.log(`[chat] step 5 done (${Date.now() - t4}ms): read ${fullStdout.length} bytes of stdout`);
-
-        // Process the JSONL output. The script emits one JSON object
-        // per line; we forward each as a ChatStreamEvent.
-        const taskSubagent = new Map<string, string>();
-        const taskStartedAt = new Map<string, number>();
-        let collected = '';
-        let lastSessionId: string | undefined = sessionId;
-
-        for (const line of fullStdout.split('\n')) {
+        for (let turn = 0; turn < MAX_TURNS; turn++) {
           if (timedOut) break;
-          if (!line.trim()) continue;
-          let evt: { type: string; [k: string]: unknown };
-          try {
-            evt = JSON.parse(line);
-          } catch {
-            continue;
+
+          const tTurn = Date.now();
+          const response = await callUpstream({
+            system: mainSystemPrompt,
+            messages,
+            tools: [TASK_TOOL],
+            maxTokens: 4096,
+          });
+
+          // Forward text deltas to the client and accumulate the final
+          // text. We emit one delta per text block, which is coarser
+          // than the SDK's token-level streaming but still gives the
+          // user immediate feedback.
+          const toolUses: Array<{ id: string; name: string; input: any }> = [];
+          let turnText = '';
+          for (const block of response.content) {
+            if (block.type === 'text') {
+              turnText += block.text;
+              send({ type: 'delta', text: block.text });
+            } else if (block.type === 'tool_use') {
+              toolUses.push({ id: block.id, name: block.name, input: block.input });
+            }
           }
-          if (evt.type === '_sandbox_done') break;
-          if (evt.type === '_sandbox_error') {
+          finalText = turnText;
+
+          if (toolUses.length === 0) {
+            // No more work — emit a `message` event and break.
             send({
-              type: 'error',
-              message: String(evt.message ?? 'unknown sandbox error'),
+              type: 'message',
+              content: turnText,
+              sessionId: undefined,
             });
             break;
           }
-          // Session init
-          if (evt.type === 'system' && evt.subtype === 'init') {
-            const data = evt.data as { session_id?: string } | undefined;
-            if (data?.session_id) lastSessionId = data.session_id;
-            continue;
-          }
-          // Subagent start
-          if (evt.type === 'system' && evt.subtype === 'task_started') {
-            const m = evt as unknown as {
-              task_id: string;
-              subagent_type?: string;
-              description?: string;
-              prompt?: string;
-            };
-            const subagentId = m.subagent_type ?? m.description ?? '';
-            const safeKey = subagentId.replace(/[^a-zA-Z0-9_-]/g, '-');
-            taskStartedAt.set(m.task_id, Date.now() - startedAt);
-            taskSubagent.set(m.task_id, safeKey);
+
+          // Append the assistant turn verbatim so the model can see its
+          // own tool_use blocks on the next call.
+          messages.push({ role: 'assistant', content: response.content });
+
+          // Dispatch each Task tool_use, in order. The model is told to
+          // emit one at a time but we handle the general case.
+          const toolResults: Array<{
+            type: 'tool_result';
+            tool_use_id: string;
+            content: string;
+            is_error?: boolean;
+          }> = [];
+          for (const tu of toolUses) {
+            if (tu.name !== 'Task') {
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: tu.id,
+                content: `Unknown tool: ${tu.name}`,
+                is_error: true,
+              });
+              continue;
+            }
+            const subId = String(tu.input?.subagent_type ?? '').trim();
+            const subPrompt = String(tu.input?.prompt ?? '').trim();
+            if (!subId || !subPrompt) {
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: tu.id,
+                content: 'Task tool_use missing subagent_type or prompt',
+                is_error: true,
+              });
+              continue;
+            }
+            if (!subagentIds.has(subId)) {
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: tu.id,
+                content: `Unknown subagent_type: ${subId}. Available: ${[...subagentIds].join(', ')}`,
+                is_error: true,
+              });
+              continue;
+            }
+
+            const subStart = Date.now() - startedAt;
             send({
               type: 'hotload',
-              subagentId: safeKey,
-              prompt: preview(m.prompt ?? m.description ?? '', 400),
-              startedAt: Date.now() - startedAt,
+              subagentId: subId,
+              prompt: preview(subPrompt, 400),
+              startedAt: subStart,
             });
-            continue;
-          }
-          // Subagent done
-          if (evt.type === 'system' && evt.subtype === 'task_notification') {
-            const m = evt as unknown as {
-              task_id: string;
-              status: string;
-              summary?: string;
-              usage?: { duration_ms?: number };
-            };
-            const roleId = taskSubagent.get(m.task_id);
-            if (roleId) {
-              const subStart = taskStartedAt.get(m.task_id) ?? Date.now() - startedAt;
+
+            try {
+              const subText = await dispatchSubagent(
+                internalBase,
+                subId,
+                subPrompt,
+                ac.signal,
+              );
               send({
                 type: 'hotload_done',
-                subagentId: roleId,
-                resultPreview: preview(m.summary ?? '', 240),
-                durationMs: m.usage?.duration_ms ?? Date.now() - startedAt - subStart,
+                subagentId: subId,
+                resultPreview: preview(subText, 240),
+                durationMs: Date.now() - startedAt - subStart,
               });
-              taskStartedAt.delete(m.task_id);
-              taskSubagent.delete(m.task_id);
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: tu.id,
+                content: subText,
+              });
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : 'subagent failed';
+              send({
+                type: 'hotload_done',
+                subagentId: subId,
+                resultPreview: preview(msg, 240),
+                durationMs: Date.now() - startedAt - subStart,
+              });
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: tu.id,
+                content: `Subagent ${subId} failed: ${msg}`,
+                is_error: true,
+              });
             }
-            continue;
           }
-          // Stream partial tokens
-          if (evt.type === 'stream_event') {
-            const ev = (
-              evt as { event?: { type?: string; delta?: { type?: string; text?: string } } }
-            ).event;
-            if (
-              ev?.type === 'content_block_delta' &&
-              ev.delta?.type === 'text_delta' &&
-              typeof ev.delta.text === 'string'
-            ) {
-              collected += ev.delta.text;
-              send({ type: 'delta', text: ev.delta.text });
-            }
-            continue;
-          }
-          if (evt.type === 'user' || evt.type === 'system') continue;
-          // Final assistant message
-          if (evt.type === 'assistant') {
-            const m = evt as unknown as {
-              message?: {
-                content?: Array<{ type: string; text?: string; name?: string; input?: unknown }>;
-              };
-            };
-            const blocks = m.message?.content ?? [];
-            const text = blocks
-              .filter((b) => b.type === 'text' && typeof b.text === 'string')
-              .map((b) => b.text)
-              .join('');
-            send({ type: 'message', content: text, sessionId: undefined });
-            if (text && text.length > collected.length) {
-              const tail = text.slice(collected.length);
-              collected = text;
-              send({ type: 'delta', text: tail });
-            }
-            continue;
-          }
-          if (evt.type === 'result') {
-            const r = evt as unknown as { session_id?: string };
-            if (r.session_id) lastSessionId = r.session_id;
-          }
+
+          // Feed the results back as a user turn (Anthropic's wire
+          // format requires tool_result to be inside a user message).
+          messages.push({ role: 'user', content: toolResults });
+          console.log(
+            `[chat] turn ${turn} done (${Date.now() - tTurn}ms): ${toolUses.length} task(s) dispatched`,
+          );
         }
 
         if (timedOut) {
@@ -470,20 +375,13 @@ export async function POST(req: NextRequest) {
             message: 'stream timed out before the model produced a final answer',
           });
         }
-        // SANITY: dump full state.
-        const logFileCmd = await sandbox.runCommand({
-          cmd: 'sh',
-          args: ['-c', `cat ${SANDBOX_HERE}/.env.runtime 2>&1; echo ---; cat ${SANDBOX_HERE}/last-run.log 2>&1; echo ---; ls -la ${SANDBOX_HERE}/`],
-        });
-        const debugText = (await logFileCmd.stdout().catch(() => '')) || '';
-        const stderr2 = (await command.stderr().catch(() => '')) || '';
-        send({
-          type: 'message',
-          content: `[sanity] exit=${command?.exitCode} stdoutLen=${fullStdout.length} stderrLen=${stderr2.length}\n---debug---\n${debugText.slice(0, 4000)}\n---last-run.log---\n${fullStdout.slice(0, 2000)}`,
-        });
+        // Reference finalText so the value is "used" — the message
+        // event already carried it but we keep the variable in case a
+        // future field needs it.
+        void finalText;
         send({
           type: 'done',
-          sessionId: lastSessionId,
+          sessionId,
           durationMs: Date.now() - startedAt,
         });
       } catch (err) {
@@ -496,14 +394,6 @@ export async function POST(req: NextRequest) {
         });
       } finally {
         clearTimeout(hardTimer);
-        // Try to stop the running command if the client disconnected.
-        // We deliberately do NOT call sandbox.stop() — the sandbox is
-        // persistent and may serve other concurrent requests.
-        try {
-          await command?.kill?.();
-        } catch {
-          /* already done */
-        }
         try {
           controller.close();
         } catch {
@@ -522,3 +412,7 @@ export async function POST(req: NextRequest) {
     },
   });
 }
+
+// Suppress unused warning for MAX_TASK_DEPTH — kept as documentation of
+// the cap we enforce semantically (the SDK used to cap here).
+void MAX_TASK_DEPTH;
